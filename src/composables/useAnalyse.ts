@@ -3,9 +3,26 @@ import { useStorage } from '@vueuse/core'
 import { computed, ref, watch, watchEffect } from 'vue'
 import { addAdditionalPreset, additionalPromptPresets, computeStringHash, customPrompts, favoriteResults, fileToBase64, generateContent, getPromptById, providers, removeAdditionalPreset, saveImage } from '~/logic'
 
+/** 多轮对话消息（Gemini 原生格式，logic 层会转换为 OpenAI 格式） */
+export interface ChatMessage {
+  role: 'user' | 'model'
+  parts: any[]
+}
+
+/** 延续对话的一轮问答（用于界面展示与保存） */
+export interface FollowupTurn {
+  question: string
+  answer: string
+}
+
+interface PendingImage {
+  base64: string
+  mimeType: string
+  sourceUrl?: string
+}
+
 export function useAnalyse() {
-  const image = ref<File | string | null>(null)
-  const base64Image = ref<string | null>(null)
+  const images = ref<(File | string)[]>([])
 
   const selectedProviderId = useStorage<string | undefined>('selected-provider-id', undefined)
   const selectedModelId = useStorage('selected-model', '')
@@ -20,6 +37,13 @@ export function useAnalyse() {
   const isEditingResult = ref(false)
   const editedResultText = ref('')
 
+  // 延续对话
+  const chatHistory = ref<ChatMessage[]>([])
+  const followupTurns = ref<FollowupTurn[]>([])
+  const followupInput = ref('')
+  const followupLoading = ref(false)
+  const followupStreamingAnswer = ref('')
+
   const lastFavoriteResult = ref<FavoriteResult | null>(null)
 
   const selectedProvider = computed(() => {
@@ -27,6 +51,9 @@ export function useAnalyse() {
       return undefined
     return providers.value.find(p => p.id === selectedProviderId.value)
   })
+
+  // 纯文本模式：未上传任何图片
+  const isTextOnlyMode = computed(() => images.value.length === 0)
 
   // 当供应商 id 改变时，清空已选的模型
   watch(selectedProviderId, () => {
@@ -60,9 +87,8 @@ export function useAnalyse() {
   const analyseButtonDisabled = computed(() => {
     if (!selectedModelId.value || !selectedPromptId.value || !selectedProvider.value)
       return true
-    if (typeof image.value === 'string')
-      return !image.value
-    return !image.value
+    // 有图片即可分析；没有图片时，需要填写提示词以纯文本生成
+    return isTextOnlyMode.value && !additionalPrompt.value.trim()
   })
 
   // 额外提示词预设（标签栏模式）
@@ -120,6 +146,8 @@ export function useAnalyse() {
     errorMsg.value = ''
     isEditingResult.value = false
     saveButtonDisabled.value = false
+    chatHistory.value = []
+    followupTurns.value = []
     result.value = [
       '## 测试结果',
       '',
@@ -144,8 +172,7 @@ export function useAnalyse() {
       result: result.value,
       prompt: selectedPrompt.value?.content ?? '',
       additionalPrompt: additionalPrompt.value.trim(),
-      _pendingBase64: '',
-      _sourceUrl: undefined,
+      _pendingImages: [],
     } as any
   }
 
@@ -163,6 +190,11 @@ export function useAnalyse() {
     return { base64: btoa(binary), mimeType }
   }
 
+  function isBlockedResponse(response: any): boolean {
+    return (response.candidates && response.candidates[0]?.finishReason === 'PROHIBITED_CONTENT')
+      || !!response.promptFeedback?.blockReason
+  }
+
   async function handleAnalyseButtonClick() {
     const provider = selectedProvider.value
     if (!provider) {
@@ -175,13 +207,15 @@ export function useAnalyse() {
       return
     }
 
-    if (!image.value) {
-      errorMsg.value = '请先上传图片或输入图片链接。'
+    if (isTextOnlyMode.value && !additionalPrompt.value.trim()) {
+      errorMsg.value = '请上传图片，或不传图片时填写提示词直接生成内容。'
       return
     }
-    if (image.value instanceof File && image.value.size > 20 * 1024 * 1024) {
-      errorMsg.value = '图片大小不能超过 20MB，请选择较小的图片。'
-      return
+    for (const img of images.value) {
+      if (img instanceof File && img.size > 20 * 1024 * 1024) {
+        errorMsg.value = '单张图片大小不能超过 20MB，请选择较小的图片。'
+        return
+      }
     }
 
     if (!selectedPrompt.value) {
@@ -192,107 +226,186 @@ export function useAnalyse() {
     analyseButtonLoading.value = true
     errorMsg.value = ''
     result.value = ''
+    isEditingResult.value = false
+    chatHistory.value = []
+    followupTurns.value = []
+    followupInput.value = ''
+    followupStreamingAnswer.value = ''
 
     try {
       const systemInstruction = selectedPrompt.value.content || '分析这张图片'
 
       const userText = additionalPrompt.value.trim()
-        ? `用户补充说明：${additionalPrompt.value.trim()}`
-        : ''
 
-      let sourceUrl: string | undefined
-      let mimeType: string
-      if (typeof image.value === 'string') {
-        sourceUrl = image.value
-        const result = await urlToBase64(sourceUrl)
-        base64Image.value = result.base64
-        mimeType = result.mimeType
+      // 组装本轮用户消息：所有图片 + 文字
+      const userParts: any[] = []
+      const pendingImages: PendingImage[] = []
+      for (const img of images.value) {
+        if (typeof img === 'string') {
+          const { base64, mimeType } = await urlToBase64(img)
+          userParts.push({ inlineData: { data: base64, mimeType } })
+          pendingImages.push({ base64, mimeType, sourceUrl: img })
+        }
+        else {
+          const base64 = await fileToBase64(img)
+          userParts.push({ inlineData: { data: base64, mimeType: img.type } })
+          pendingImages.push({ base64, mimeType: img.type })
+        }
       }
-      else {
-        base64Image.value = await fileToBase64(image.value!)
-        mimeType = image.value!.type
-      }
-      const contents: Parameters<typeof generateContent>[1] = [
-        { inlineData: { data: base64Image.value, mimeType } },
-      ]
       if (userText)
-        contents.push({ text: userText })
+        userParts.push({ text: userText })
+      if (userParts.length === 0)
+        userParts.push({ text: '请根据系统提示词的要求生成内容。' })
+
+      chatHistory.value = [{ role: 'user', parts: userParts }]
 
       const response = await generateContent(
         selectedModelId.value,
-        contents,
+        chatHistory.value,
         systemInstruction,
         provider,
         (chunk) => {
           result.value += chunk
         },
       )
-      const lastImage = base64Image.value
 
       console.log(response)
       if (response.text === '' || response.text === null || response.text === undefined) {
-        if ((response.candidates && response.candidates[0]?.finishReason === 'PROHIBITED_CONTENT')
-          || (response as any).promptFeedback?.blockReason) {
+        if (isBlockedResponse(response)) {
           errorMsg.value = '内容被安全过滤器阻止，请重试或更换模型。'
         }
         else {
           errorMsg.value = '发生未知错误，请稍后再试或检查控制台日志。'
         }
+        chatHistory.value = []
       }
       else {
         saveButtonDisabled.value = false
         result.value = response.text!
         errorMsg.value = ''
+        chatHistory.value.push({ role: 'model', parts: [{ text: response.text! }] })
         lastFavoriteResult.value = {
           model: selectedModelId.value,
           mode: selectedPromptId.value,
           imageHash: '',
-          mimeType,
+          mimeType: pendingImages[0]?.mimeType ?? '',
           time: Date.now(),
           result: response.text!,
           prompt: selectedPrompt.value?.content ?? '',
           additionalPrompt: additionalPrompt.value.trim(),
-          _pendingBase64: lastImage,
-          _sourceUrl: sourceUrl,
+          _pendingImages: pendingImages,
         } as any
       }
     }
     catch (error) {
       console.error('[Analysis Error]', { provider: provider.name, error })
       errorMsg.value = `Error: ${(error as Error).message || String(error)}`
+      chatHistory.value = []
     }
     finally {
       analyseButtonLoading.value = false
     }
   }
 
+  // 基于当前结果延续对话
+  async function handleSendFollowup() {
+    const text = followupInput.value.trim()
+    if (!text || followupLoading.value || analyseButtonLoading.value)
+      return
+
+    const provider = selectedProvider.value
+    if (!provider) {
+      errorMsg.value = '请先选择供应商。'
+      return
+    }
+    if (!provider.apiKey) {
+      errorMsg.value = `请先配置「${provider.name}」的 API 密钥。`
+      return
+    }
+    if (chatHistory.value.length === 0) {
+      errorMsg.value = '当前没有可延续的生成结果，请先点击「分析 / 生成」。'
+      return
+    }
+
+    followupLoading.value = true
+    followupStreamingAnswer.value = ''
+    followupInput.value = ''
+    errorMsg.value = ''
+
+    try {
+      chatHistory.value.push({ role: 'user', parts: [{ text }] })
+      const response = await generateContent(
+        selectedModelId.value,
+        chatHistory.value,
+        selectedPrompt.value?.content || '',
+        provider,
+        (chunk) => {
+          followupStreamingAnswer.value += chunk
+        },
+      )
+
+      const answer = response.text || ''
+      if (!answer) {
+        chatHistory.value.pop()
+        followupInput.value = text
+        errorMsg.value = isBlockedResponse(response)
+          ? '内容被安全过滤器阻止，请重试或更换模型。'
+          : '发生未知错误，请稍后再试或检查控制台日志。'
+        return
+      }
+
+      chatHistory.value.push({ role: 'model', parts: [{ text: answer }] })
+      followupTurns.value.push({ question: text, answer })
+      // 延续对话后允许重新保存
+      saveButtonDisabled.value = false
+    }
+    catch (error) {
+      console.error('[Followup Error]', { provider: provider.name, error })
+      chatHistory.value.pop()
+      followupInput.value = text
+      errorMsg.value = `Error: ${(error as Error).message || String(error)}`
+    }
+    finally {
+      followupLoading.value = false
+      followupStreamingAnswer.value = ''
+    }
+  }
+
   async function handleSaveButtonClick() {
     saveButtonDisabled.value = true
     const pending = lastFavoriteResult.value as any
-    const base64 = pending._pendingBase64 as string
-    const mimeType = pending.mimeType as string
-    const sourceUrl = pending._sourceUrl as string | undefined
+    if (!pending)
+      return
+    const pendingImages = (pending._pendingImages ?? []) as PendingImage[]
 
-    let hash: string
+    // 保存时把延续对话追加到结果末尾
+    let resultText = pending.result as string
+    if (followupTurns.value.length > 0) {
+      const conversation = followupTurns.value
+        .map(turn => `**问：${turn.question}**\n\n${turn.answer}`)
+        .join('\n\n')
+      resultText = `${resultText}\n\n---\n\n## 延续对话\n\n${conversation}`
+    }
+
     const item: FavoriteResult = {
       model: pending.model,
       mode: pending.mode,
       imageHash: '',
-      mimeType,
+      mimeType: pendingImages[0]?.mimeType ?? '',
       time: pending.time,
-      result: pending.result,
+      result: resultText,
       prompt: pending.prompt ?? '',
       additionalPrompt: pending.additionalPrompt ?? '',
     }
 
-    if (sourceUrl) {
-      hash = await computeStringHash(sourceUrl)
-      item.imageHash = hash
-      item.imageUrl = sourceUrl
+    // 收藏只保留第一张图片作为主要图片；纯文本生成则无图片
+    const firstImage = pendingImages[0]
+    if (firstImage?.sourceUrl) {
+      item.imageHash = await computeStringHash(firstImage.sourceUrl)
+      item.imageUrl = firstImage.sourceUrl
     }
-    else {
-      hash = await saveImage(base64, mimeType)
-      item.imageHash = hash
+    else if (firstImage) {
+      item.imageHash = await saveImage(firstImage.base64, firstImage.mimeType)
     }
 
     if (!favoriteResults.data.value)
@@ -301,7 +414,8 @@ export function useAnalyse() {
   }
 
   return {
-    image,
+    images,
+    isTextOnlyMode,
     selectedProviderId,
     selectedModelId,
     selectedPromptId,
@@ -329,5 +443,10 @@ export function useAnalyse() {
     handleConfirmEditResult,
     handleCancelEditResult,
     handleFillTestResult,
+    followupTurns,
+    followupInput,
+    followupLoading,
+    followupStreamingAnswer,
+    handleSendFollowup,
   }
 }
