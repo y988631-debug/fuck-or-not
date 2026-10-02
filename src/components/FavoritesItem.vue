@@ -389,12 +389,23 @@ function downloadImage() {
       class="relative"
     >
       <img
+        v-if="imageSrc"
         :src="imageSrc"
         :alt="`Favorite item image at ${formatTime(props.item.time)}`"
         class="preview"
         rounded max-h-100 max-w-full object-contain
         bg-transparent block
       >
+      <div
+        v-else
+        flex="~ col items-center justify-center gap-2"
+        op-40 min-h-40
+      >
+        <div i-carbon-text-font text-2xl />
+        <div text-xs>
+          纯文本生成（无图片）
+        </div>
+      </div>
     </div>
 
     <div
